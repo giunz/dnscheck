@@ -6,7 +6,8 @@
 - Resolves A, CNAME, MX, and SOA records using Cloudflare DNS (`1.1.1.1`).
 - Follows full CNAME chains to improve CDN/cloud detection.
 - Performs HTTP and HTTPS requests with realistic headers.
-- Detects common WAFs, CDNs, and cloud providers via headers, cookies, and DNS data (including Azure SOA values such as `azuredns-hostmaster.microsoft.com`).
+- Detects common WAFs, CDNs, and cloud providers via headers, cookies, and DNS data (including Azure SOA values such as `azuredns-hostmaster.microsoft.com` and Azure front-door hostnames like `azurefd.net`).
+- Rotates modern Chrome user agents, accepts basic cookie-consent banners, and adds short pauses to appear more human-like during HTTP checks.
 - Processes domains concurrently with a progress bar.
 
 ## Requirements

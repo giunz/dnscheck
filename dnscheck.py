@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import random
 import socket
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Iterable, List
@@ -44,15 +46,27 @@ resolver.nameservers = ["1.1.1.1"]
 resolver.lifetime = 3
 
 # Realistic headers for human-like behavior
-headers = {
-    "User-Agent": (
+USER_AGENTS = [
+    (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     ),
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    ),
+]
+
+BROWSER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Language": "en-US,en;q=0.6",
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "no-cache",
 }
+
+COOKIE_CONSENT_COOKIE = ("cookie_consent", "accepted")
 
 # WAF signatures
 WAF_SIGNATURES: Dict[str, List[str] | str] = {
@@ -88,6 +102,12 @@ CLOUD_PATTERNS = {
     "cloudfront.net": "AWS",
     "azure.com": "Azure",
     "azure-dns.com": "Azure",
+    "azurefd.net": "Azure",
+    "azureedge.net": "Azure",
+    "azurewebsites.net": "Azure",
+    "cloudapp.azure.com": "Azure",
+    "trafficmanager.net": "Azure",
+    "windows.net": "Azure",
     "microsoft.com": "Azure",
     "azuredns-hostmaster.microsoft.com": "Azure",
     "googleusercontent.com": "GCP",
@@ -147,12 +167,22 @@ def get_dns_records(domain: str) -> Dict[str, List[str] | str]:
     return records
 
 
+def build_browser_headers() -> Dict[str, str]:
+    return {"User-Agent": random.choice(USER_AGENTS), **BROWSER_HEADERS}
+
+
 def check_http(domain: str, protocol: str = "http"):
     url = f"{protocol}://{domain}"
     logging.info(f"[HTTP] Checking {protocol.upper()} for {domain}")
     try:
         session = requests.Session()
-        response = session.get(url, headers=headers, timeout=8, allow_redirects=True)
+        session.headers.update(build_browser_headers())
+        try:
+            session.cookies.set(COOKIE_CONSENT_COOKIE[0], COOKIE_CONSENT_COOKIE[1], domain=domain)
+        except Exception:
+            session.cookies.set(COOKIE_CONSENT_COOKIE[0], COOKIE_CONSENT_COOKIE[1])
+        time.sleep(random.uniform(0.2, 0.6))
+        response = session.get(url, timeout=8, allow_redirects=True)
         return response.status_code, response.headers, session.cookies.get_dict()
     except requests.exceptions.RequestException:
         return "Error", {}, {}
