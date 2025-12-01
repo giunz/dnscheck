@@ -51,7 +51,10 @@ headers = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Upgrade-Insecure-Requests": "1",
     "Connection": "keep-alive",
+    "Cache-Control": "no-cache",
 }
 
 # WAF signatures
@@ -90,8 +93,30 @@ CLOUD_PATTERNS = {
     "azure-dns.com": "Azure",
     "microsoft.com": "Azure",
     "azuredns-hostmaster.microsoft.com": "Azure",
+    "azurewebsites.net": "Azure",
+    "azurefd.net": "Azure",
+    "azureedge.net": "Azure",
+    "trafficmanager.net": "Azure",
+    "cloudapp.net": "Azure",
+    "windows.net": "Azure",
     "googleusercontent.com": "GCP",
     "googleapis.com": "GCP",
+}
+
+AZURE_HTTP_SIGNATURES = {
+    "x-azure-ref": "Azure",
+    "x-msedge-ref": "Azure",
+    "x-ms-request-id": "Azure",
+    "x-azure-socketextn": "Azure",
+    "x-azure-fdid": "Azure",
+}
+
+AZURE_COOKIE_PATTERNS = {
+    "arraffinity": "Azure",
+    "arraffinitysame": "Azure",
+    "afd-session": "Azure",
+    "afd-state": "Azure",
+    "x-ms-routing-name": "Azure",
 }
 
 
@@ -152,18 +177,23 @@ def check_http(domain: str, protocol: str = "http"):
     logging.info(f"[HTTP] Checking {protocol.upper()} for {domain}")
     try:
         session = requests.Session()
-        response = session.get(url, headers=headers, timeout=8, allow_redirects=True)
-        return response.status_code, response.headers, session.cookies.get_dict()
+        session.headers.update(headers)
+        response = session.get(url, timeout=10, allow_redirects=True)
+        normalized_headers = {k.lower(): v for k, v in response.headers.items()}
+        normalized_cookies = {k.lower(): v for k, v in session.cookies.get_dict().items()}
+        return response.status_code, normalized_headers, normalized_cookies, str(response.url)
     except requests.exceptions.RequestException:
-        return "Error", {}, {}
+        return "Error", {}, {}, url
 
 
 def detect_waf(headers_dict: Dict[str, str], cookies: Dict[str, str]) -> str:
+    normalized_headers = {k.lower(): v for k, v in headers_dict.items()}
     for key, value in WAF_SIGNATURES.items():
-        if key in headers_dict:
+        header_key = key.lower()
+        if header_key in normalized_headers:
             if isinstance(value, list):
                 for v in value:
-                    if v.lower() in headers_dict[key].lower():
+                    if v.lower() in normalized_headers[header_key].lower():
                         return v
             else:
                 return value
@@ -183,7 +213,9 @@ def detect_cdn(cname_list: Iterable[str]) -> str:
     return "None"
 
 
-def detect_cloud(records: Dict[str, List[str] | str]) -> str:
+def detect_cloud(
+    records: Dict[str, List[str] | str], http_signals: Dict[str, Dict[str, str] | List[str]] | None = None
+) -> str:
     soa_value = str(records["SOA"]).lower()
     for pattern, provider in CLOUD_PATTERNS.items():
         if pattern in soa_value:
@@ -202,6 +234,30 @@ def detect_cloud(records: Dict[str, List[str] | str]) -> str:
                     return provider
         except Exception:
             continue
+
+    http_signals = http_signals or {}
+    merged_headers = {k.lower(): v for k, v in http_signals.get("headers", {}).items()}
+    merged_cookies = {k.lower(): v for k, v in http_signals.get("cookies", {}).items()}
+    visited_urls = [u.lower() for u in http_signals.get("urls", []) if u]
+
+    for url in visited_urls:
+        for pattern, provider in CLOUD_PATTERNS.items():
+            if pattern in url:
+                return provider
+
+    for header_name, provider in AZURE_HTTP_SIGNATURES.items():
+        if header_name in merged_headers:
+            return provider
+
+    for cookie_name in merged_cookies.keys():
+        for pattern, provider in AZURE_COOKIE_PATTERNS.items():
+            if pattern in cookie_name:
+                return provider
+
+    server_header = merged_headers.get("server", "")
+    if server_header and "envoy" in server_header.lower():
+        return "Azure"
+
     return "None"
 
 
@@ -209,12 +265,19 @@ def process_domain(row: pd.Series) -> Dict[str, str]:
     domain = row["URLs"]
     logging.info(f"--- Processing {domain} ---")
     dns_info = get_dns_records(domain)
-    http_status, http_headers, http_cookies = check_http(domain, "http")
-    https_status, https_headers, https_cookies = check_http(domain, "https")
+    http_status, http_headers, http_cookies, http_url = check_http(domain, "http")
+    https_status, https_headers, https_cookies, https_url = check_http(domain, "https")
 
     waf_detect = detect_waf({**http_headers, **https_headers}, {**http_cookies, **https_cookies})
     cdn_detect = detect_cdn(dns_info["CNAME"])
-    cloud_hosting = detect_cloud(dns_info)
+    cloud_hosting = detect_cloud(
+        dns_info,
+        {
+            "headers": {**http_headers, **https_headers},
+            "cookies": {**http_cookies, **https_cookies},
+            "urls": [http_url, https_url],
+        },
+    )
 
     logging.info(
         f"[DONE] {domain} | WAF: {waf_detect} | CDN: {cdn_detect} | Cloud: {cloud_hosting} | SOA: {dns_info['SOA']}"
