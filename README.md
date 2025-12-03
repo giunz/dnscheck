@@ -1,11 +1,12 @@
 # dnscheck
 
-`dnscheck.py` performs bulk DNS and HTTP/HTTPS checks for a list of domains (or a single domain), saving structured results to `output.csv` and a detailed log to `scan_log.txt`.
+`dnscheck.py` performs bulk DNS and HTTP/HTTPS checks for a list of domains (or a single domain), saving structured results to `output.csv` and a detailed log to `scan_log.txt`. It also opens pages in a headless Chromium browser via Playwright to verify that sites can be reached.
 
 ## Features
 - Resolves A, CNAME, MX, and SOA records using Cloudflare DNS (`1.1.1.1`).
 - Follows full CNAME chains to improve CDN/cloud detection.
 - Performs HTTP and HTTPS requests with realistic headers.
+- Loads pages headlessly with Playwright to confirm site reachability and capture HTTP status/title.
 - Detects common WAFs, CDNs, and cloud providers via headers, cookies, and DNS data (including Azure SOA values such as `azuredns-hostmaster.microsoft.com`).
 - Processes domains concurrently with a progress bar.
 
@@ -13,8 +14,12 @@
 Install Python dependencies:
 
 ```bash
-pip install dnspython requests pandas tqdm
+pip install dnspython requests pandas tqdm playwright
+python -m playwright install chromium
 ```
+
+During a run, press `Ctrl+C` to cancel the scan early; partial results collected
+so far will still be written to the output file.
 
 ## Usage
 ### Scan domains from a CSV
@@ -30,6 +35,7 @@ python dnscheck.py --input input.csv --output output.csv
 
 3. Review outputs:
    - `output.csv` contains DNS answers, HTTP/HTTPS status codes, and detected WAF/CDN/cloud providers.
+   - Playwright columns capture the protocol, HTTP status, and page title observed by a headless browser (useful when basic requests fail but the site still loads in a real browser).
    - `scan_log.txt` contains per-domain processing details.
 
 ### Scan a single domain quickly

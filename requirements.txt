@@ -2,3 +2,4 @@ dnspython
 pandas
 requests
 tqdm
+playwright

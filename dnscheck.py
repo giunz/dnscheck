@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List
 
 import dns.resolver
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 import pandas as pd
 import requests
 from tqdm import tqdm
@@ -186,6 +188,45 @@ def check_http(domain: str, protocol: str = "http"):
         return "Error", {}, {}, url
 
 
+def check_with_playwright(domain: str) -> Dict[str, str | int]:
+    logging.info(f"[Playwright] Checking site existence for {domain}")
+    result: Dict[str, str | int] = {
+        "Playwright_Status": "Not Checked",
+        "Playwright_Protocol": "",
+        "Playwright_Title": "",
+    }
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+
+            for protocol in ("https", "http"):
+                url = f"{protocol}://{domain}"
+                try:
+                    response = page.goto(url, wait_until="domcontentloaded", timeout=8000)
+                    result["Playwright_Status"] = response.status if response else "No Response"
+                    result["Playwright_Protocol"] = protocol
+                    result["Playwright_Title"] = page.title()
+                    logging.info(
+                        f"[Playwright] {domain} reachable via {protocol.upper()} (status: {result['Playwright_Status']})"
+                    )
+                    break
+                except PlaywrightTimeoutError:
+                    logging.warning(f"[Playwright] Timeout reaching {url}")
+                except Exception as exc:
+                    logging.warning(f"[Playwright] Error reaching {url}: {exc}")
+
+            browser.close()
+    except Exception as exc:
+        logging.warning(f"[Playwright] Failed to launch browser for {domain}: {exc}")
+        result["Playwright_Status"] = "Playwright Error"
+
+    if result["Playwright_Status"] == "Not Checked":
+        result["Playwright_Status"] = "Unreachable"
+    return result
+
+
 def detect_waf(headers_dict: Dict[str, str], cookies: Dict[str, str]) -> str:
     normalized_headers = {k.lower(): v for k, v in headers_dict.items()}
     for key, value in WAF_SIGNATURES.items():
@@ -267,6 +308,7 @@ def process_domain(row: pd.Series) -> Dict[str, str]:
     dns_info = get_dns_records(domain)
     http_status, http_headers, http_cookies, http_url = check_http(domain, "http")
     https_status, https_headers, https_cookies, https_url = check_http(domain, "https")
+    playwright_result = check_with_playwright(domain)
 
     waf_detect = detect_waf({**http_headers, **https_headers}, {**http_cookies, **https_cookies})
     cdn_detect = detect_cdn(dns_info["CNAME"])
@@ -296,16 +338,29 @@ def process_domain(row: pd.Series) -> Dict[str, str]:
         "auto_WAF_detect": waf_detect,
         "CDN_detect": cdn_detect,
         "Cloud_Hosting": cloud_hosting,
+        "Playwright_Status": playwright_result["Playwright_Status"],
+        "Playwright_Protocol": playwright_result["Playwright_Protocol"],
+        "Playwright_Title": playwright_result["Playwright_Title"],
     }
 
 
-def run_scan(df: pd.DataFrame) -> List[Dict[str, str]]:
+def run_scan(df: pd.DataFrame) -> tuple[List[Dict[str, str]], bool]:
     results: List[Dict[str, str]] = []
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    interrupted = False
+    with ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(process_domain, row) for _, row in df.iterrows()]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing Domains"):
-            results.append(future.result())
-    return results
+        try:
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc="Processing Domains"
+            ):
+                results.append(future.result())
+        except KeyboardInterrupt:
+            interrupted = True
+            logging.warning("Scan interrupted by user. Cancelling remaining tasks.")
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+    return results, interrupted
 
 
 def load_input(input_path: Path, single_domain: str | None = None) -> pd.DataFrame:
@@ -329,12 +384,23 @@ def main() -> None:
     input_path = Path(args.input)
     df = load_input(input_path, args.domain)
 
-    results = run_scan(df)
+    try:
+        results, interrupted = run_scan(df)
+    except KeyboardInterrupt:
+        logging.warning("Second interrupt received. Exiting without saving results.")
+        print("❌ Scan cancelled before saving results.")
+        return
+
     output_df = pd.DataFrame(results)
     output_df.to_csv(args.output, index=False)
 
     logging.info(f"Results saved to {args.output}")
-    print(f"✅ Scan complete! Results saved to {args.output}. Logs in scan_log.txt")
+    if interrupted:
+        print(
+            f"⚠️ Scan interrupted by user. Partial results saved to {args.output}. Logs in scan_log.txt"
+        )
+    else:
+        print(f"✅ Scan complete! Results saved to {args.output}. Logs in scan_log.txt")
 
 
 if __name__ == "__main__":
