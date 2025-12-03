@@ -344,13 +344,23 @@ def process_domain(row: pd.Series) -> Dict[str, str]:
     }
 
 
-def run_scan(df: pd.DataFrame) -> List[Dict[str, str]]:
+def run_scan(df: pd.DataFrame) -> tuple[List[Dict[str, str]], bool]:
     results: List[Dict[str, str]] = []
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    interrupted = False
+    with ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(process_domain, row) for _, row in df.iterrows()]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing Domains"):
-            results.append(future.result())
-    return results
+        try:
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc="Processing Domains"
+            ):
+                results.append(future.result())
+        except KeyboardInterrupt:
+            interrupted = True
+            logging.warning("Scan interrupted by user. Cancelling remaining tasks.")
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+    return results, interrupted
 
 
 def load_input(input_path: Path, single_domain: str | None = None) -> pd.DataFrame:
@@ -374,12 +384,23 @@ def main() -> None:
     input_path = Path(args.input)
     df = load_input(input_path, args.domain)
 
-    results = run_scan(df)
+    try:
+        results, interrupted = run_scan(df)
+    except KeyboardInterrupt:
+        logging.warning("Second interrupt received. Exiting without saving results.")
+        print("❌ Scan cancelled before saving results.")
+        return
+
     output_df = pd.DataFrame(results)
     output_df.to_csv(args.output, index=False)
 
     logging.info(f"Results saved to {args.output}")
-    print(f"✅ Scan complete! Results saved to {args.output}. Logs in scan_log.txt")
+    if interrupted:
+        print(
+            f"⚠️ Scan interrupted by user. Partial results saved to {args.output}. Logs in scan_log.txt"
+        )
+    else:
+        print(f"✅ Scan complete! Results saved to {args.output}. Logs in scan_log.txt")
 
 
 if __name__ == "__main__":

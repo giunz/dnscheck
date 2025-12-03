@@ -18,6 +18,9 @@ pip install dnspython requests pandas tqdm playwright
 python -m playwright install chromium
 ```
 
+During a run, press `Ctrl+C` to cancel the scan early; partial results collected
+so far will still be written to the output file.
+
 ## Usage
 ### Scan domains from a CSV
 1. Prepare `input.csv` with at least the following columns:
