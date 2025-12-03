@@ -46,6 +46,10 @@ python dnscheck.py --domain ua.coca-colahellenic.com --output single-result.csv
 ```
 
 ## Notes
-- The script uses a 3-second DNS resolver lifetime and 8-second HTTP timeouts.
+- Timeouts and concurrency are configured via constants at the top of `dnscheck.py`:
+  - `DNS_TIMEOUT = 3` seconds (resolver lifetime)
+  - `HTTP_TIMEOUT = 10` seconds
+  - `PLAYWRIGHT_TIMEOUT_MS = 8000` milliseconds
+  - `MAX_WORKERS = 8` threads for the domain processing pool
 - Network errors are recorded as `Error` status codes.
-- Adjust `max_workers` in the thread pool if you need to tune concurrency.
+- Adjust these constants if you need different timeout values or concurrency.
