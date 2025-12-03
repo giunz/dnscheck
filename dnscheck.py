@@ -20,8 +20,11 @@ import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Iterable, List
+from urllib.parse import urlparse
 
 import dns.resolver
+import dns.name
+import dns.exception
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 import pandas as pd
@@ -39,11 +42,15 @@ logging.basicConfig(
 # Input/Output files
 DEFAULT_INPUT = "input.csv"
 DEFAULT_OUTPUT = "output.csv"
+HTTP_TIMEOUT = 10
+PLAYWRIGHT_TIMEOUT_MS = 8000
+DNS_TIMEOUT = 3
+MAX_WORKERS = 8
 
 # Use Cloudflare DNS
 resolver = dns.resolver.Resolver()
 resolver.nameservers = ["1.1.1.1"]
-resolver.lifetime = 3
+resolver.lifetime = DNS_TIMEOUT
 
 # Realistic headers for human-like behavior
 headers = {
@@ -124,7 +131,13 @@ AZURE_COOKIE_PATTERNS = {
 
 def get_dns_records(domain: str) -> Dict[str, List[str] | str]:
     logging.info(f"[DNS] Checking DNS records for {domain}")
-    records: Dict[str, List[str] | str] = {"A": [], "CNAME": [], "MX": [], "SOA": ""}
+    records: Dict[str, List[str] | str] = {
+        "A": [],
+        "CNAME": [],
+        "MX": [],
+        "SOA": "",
+        "SOA_Root_Domain": "",
+    }
 
     try:
         # Follow full CNAME chain
@@ -155,11 +168,14 @@ def get_dns_records(domain: str) -> Dict[str, List[str] | str]:
     except Exception:
         pass
 
-    try:
-        soa_record = resolver.resolve(domain, "SOA")
-        records["SOA"] = soa_record[0].mname.to_text()
-    except Exception:
-        pass
+    root_domain = find_soa_root(domain)
+    records["SOA_Root_Domain"] = root_domain
+    if root_domain:
+        try:
+            soa_record = resolver.resolve(root_domain, "SOA")
+            records["SOA"] = soa_record[0].mname.to_text()
+        except Exception:
+            pass
 
     # Ensure defaults if empty
     if not records["A"]:
@@ -168,10 +184,30 @@ def get_dns_records(domain: str) -> Dict[str, List[str] | str]:
         records["CNAME"] = ["Not Found"]
     if not records["MX"]:
         records["MX"] = ["Not Found"]
+    if not records["SOA_Root_Domain"]:
+        records["SOA_Root_Domain"] = "Not Found"
     if not records["SOA"]:
         records["SOA"] = "Not Found"
 
     return records
+
+
+def find_soa_root(domain: str) -> str:
+    try:
+        name = dns.name.from_text(domain)
+    except dns.exception.DNSException:
+        return ""
+
+    current = name
+    while True:
+        candidate = current.to_text().rstrip(".")
+        try:
+            resolver.resolve(candidate, "SOA")
+            return candidate
+        except dns.exception.DNSException:
+            if current == current.parent():
+                return ""
+            current = current.parent()
 
 
 def check_http(domain: str, protocol: str = "http"):
@@ -180,7 +216,7 @@ def check_http(domain: str, protocol: str = "http"):
     try:
         session = requests.Session()
         session.headers.update(headers)
-        response = session.get(url, timeout=10, allow_redirects=True)
+        response = session.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
         normalized_headers = {k.lower(): v for k, v in response.headers.items()}
         normalized_cookies = {k.lower(): v for k, v in session.cookies.get_dict().items()}
         return response.status_code, normalized_headers, normalized_cookies, str(response.url)
@@ -204,7 +240,9 @@ def check_with_playwright(domain: str) -> Dict[str, str | int]:
             for protocol in ("https", "http"):
                 url = f"{protocol}://{domain}"
                 try:
-                    response = page.goto(url, wait_until="domcontentloaded", timeout=8000)
+                    response = page.goto(
+                        url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT_MS
+                    )
                     result["Playwright_Status"] = response.status if response else "No Response"
                     result["Playwright_Protocol"] = protocol
                     result["Playwright_Title"] = page.title()
@@ -325,6 +363,13 @@ def process_domain(row: pd.Series) -> Dict[str, str]:
         f"[DONE] {domain} | WAF: {waf_detect} | CDN: {cdn_detect} | Cloud: {cloud_hosting} | SOA: {dns_info['SOA']}"
     )
 
+    redirect_details: List[str] = []
+    for protocol, final_url in (("HTTP", http_url), ("HTTPS", https_url)):
+        parsed = urlparse(final_url)
+        if parsed.hostname and parsed.hostname.lower() != domain.lower():
+            redirect_details.append(f"{protocol} → {parsed.hostname}")
+    redirect_target = "; ".join(redirect_details) if redirect_details else "None"
+
     return {
         "URLs": domain,
         "WAF Technology": row.get("WAF Technology", ""),
@@ -333,8 +378,10 @@ def process_domain(row: pd.Series) -> Dict[str, str]:
         "DNS_CNAME": ", ".join(dns_info["CNAME"]),
         "DNS_MX": ", ".join(dns_info["MX"]),
         "DNS_SOA": dns_info["SOA"],
+        "DNS_SOA_Root": dns_info["SOA_Root_Domain"],
         "HTTP_Status": http_status,
         "HTTPS_Status": https_status,
+        "Redirect_Target": redirect_target,
         "auto_WAF_detect": waf_detect,
         "CDN_detect": cdn_detect,
         "Cloud_Hosting": cloud_hosting,
@@ -347,7 +394,7 @@ def process_domain(row: pd.Series) -> Dict[str, str]:
 def run_scan(df: pd.DataFrame) -> tuple[List[Dict[str, str]], bool]:
     results: List[Dict[str, str]] = []
     interrupted = False
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_domain, row) for _, row in df.iterrows()]
         try:
             for future in tqdm(
